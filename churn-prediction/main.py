@@ -1,6 +1,7 @@
 ### les imports
 import pandas as pd
 from sklearn.model_selection import train_test_split
+import os
 
 ### Chargement des données
 PATH = "D:\portfolio-projects\churn\data\Telco-Customer-Churn.csv"
@@ -119,5 +120,7 @@ print("Matrice de confusion (TEST) :\n", cm_test)
 print("\nRapport (TEST) :\n", classification_report(y_test, y_test_pred, digits=3))
 print("ROC-AUC (TEST):", roc_auc_score(y_test, y_test_proba))
 
+
 import joblib
+os.makedirs("models", exist_ok=True)
 joblib.dump(clf, "models/churn_model.joblib")
