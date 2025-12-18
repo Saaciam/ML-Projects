@@ -1,9 +1,9 @@
 # Churn Prediction (Telco) — Classification binaire end-to-end
 
-Ce projet construit un modèle de Machine Learning capable de **prédire le churn client** (résiliation) afin d’aider une entreprise à **anticiper les départs** et déclencher des actions de rétention (offres, appels, support). :contentReference[oaicite:3]{index=3}
+Ce projet construit un modèle de Machine Learning capable de **prédire le churn client** (résiliation) afin d’aider une entreprise à **anticiper les départs** et déclencher des actions de rétention (offres, appels, support). 
 
 > 🎯 Idée clé : il est souvent **plus coûteux** de perdre un client que de contacter un client fidèle “pour rien”.
-> Dans ce projet, on priorise donc la réduction des **faux négatifs (FN)**, c’est-à-dire les churners ratés. :contentReference[oaicite:4]{index=4}
+> Dans ce projet, on priorise donc la réduction des **faux négatifs (FN)**, c’est-à-dire les churners ratés. 
 
 ---
 
@@ -13,7 +13,7 @@ Ce projet construit un modèle de Machine Learning capable de **prédire le chur
 - Tâche : **classification binaire**
 - Cible :
   - `0` = No churn
-  - `1` = Churn :contentReference[oaicite:5]{index=5}
+  - `1` = Churn
 
 ---
 
@@ -25,7 +25,7 @@ Ce projet construit un modèle de Machine Learning capable de **prédire le chur
    - conversion `TotalCharges` en numérique
    - suppression/gestion des valeurs manquantes
 4. **Split Train / Validation / Test (70/15/15) stratifié**
-   - objectif : évaluation honnête + mêmes proportions de churn dans chaque sous-ensemble :contentReference[oaicite:6]{index=6}
+   - objectif : évaluation honnête + mêmes proportions de churn dans chaque sous-ensemble
 5. **Prétraitement**
    - numériques : `StandardScaler`
    - catégorielles : `OneHotEncoder(handle_unknown="ignore")`
@@ -33,7 +33,7 @@ Ce projet construit un modèle de Machine Learning capable de **prédire le chur
    - Régression Logistique (`class_weight="balanced"`)
 7. **Évaluation (validation) + ajustement du seuil**
 8. **Évaluation finale (test)**
-   - le test n’est utilisé qu’une fois, à la fin :contentReference[oaicite:7]{index=7}
+   - le test n’est utilisé qu’une fois, à la fin 
 
 ---
 
@@ -42,20 +42,19 @@ Ce projet construit un modèle de Machine Learning capable de **prédire le chur
 ### Matrice de confusion (TN, FP, FN, TP)
 Elle montre *où le modèle se trompe* :
 - **FN** : churners ratés (erreur la plus grave ici)
-- **FP** : clients contactés inutilement (coût marketing) :contentReference[oaicite:8]{index=8}
+- **FP** : clients contactés inutilement (coût marketing) 
 
 ### Recall vs Precision
 - **Recall(1) = TP / (TP + FN)**  
   → “Parmi les churners réels, combien j’en détecte ?”  
-  ✅ métrique prioritaire ici (FN coûteux) :contentReference[oaicite:9]{index=9}
+  ✅ métrique prioritaire ici (FN coûteux) 
 
 - **Precision(1) = TP / (TP + FP)**  
   → “Parmi ceux que je cible, combien churnent vraiment ?”  
-  utile pour contrôler le volume d’actions marketing :contentReference[oaicite:10]{index=10}
-
+  utile pour contrôler le volume d’actions marketing 
 ### Seuil de décision
 Le modèle renvoie une probabilité ; le **seuil** transforme cette proba en classe (0/1).  
-Baisser le seuil → **recall ↑** (FN ↓) mais **FP ↑** (precision ↓). :contentReference[oaicite:11]{index=11}
+Baisser le seuil → **recall ↑** (FN ↓) mais **FP ↑** (precision ↓). 
 
 ---
 
@@ -70,8 +69,7 @@ Matrice de confusion sur le jeu de test :
 
 Interprétation (impact métier) :
 - on accepte davantage de FP pour **rater moins de churners**,
-- ici : **34 churners ratés** seulement (FN), au prix de 301 faux positifs (FP). :contentReference[oaicite:12]{index=12}
-
+- ici : **34 churners ratés** seulement (FN), au prix de 301 faux positifs (FP). 
 ---
 
 ## ▶️ Installation & exécution
