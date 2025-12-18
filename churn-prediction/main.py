@@ -118,3 +118,6 @@ print("Matrice de confusion (TEST) :\n", cm_test)
 
 print("\nRapport (TEST) :\n", classification_report(y_test, y_test_pred, digits=3))
 print("ROC-AUC (TEST):", roc_auc_score(y_test, y_test_proba))
+
+import joblib
+joblib.dump(clf, "models/churn_model.joblib")
