@@ -1,0 +1,1644 @@
+---
+title: "PROJET DATA SCIENCE - Bank Marketing Data Set"
+author:
+  - "DEGNY GILLES ALFRED"
+  - "KOUTOUA CHRISTOPHER"
+  - "NIAMKE JOSEPH"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    fig_crop: false
+    keep_tex: true
+fontsize: 10pt
+geometry: margin=1in
+header-includes:
+  - '\usepackage{fvextra}'
+  - '\usepackage{makecell}'
+  - '\usepackage{array}'
+  - '\DefineVerbatimEnvironment{Highlighting}{Verbatim}{breaklines,breakanywhere,commandchars=\\\{\},fontsize=\small}'
+  - '\setlength{\tabcolsep}{3pt}'
+  - '\setlength{\emergencystretch}{3em}'
+---
+
+```{r packages}
+# install.packages("xgboost")
+# install.packages(c("dplyr", "readr", "ggplot2", "tidyr", "purrr", "tibble",
+#                    "recipes", "themis", "glmnet", "ranger", "yardstick", "knitr"))
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(readr)
+  library(ggplot2)
+  library(tidyr)
+  library(purrr)
+  library(tibble)
+  library(recipes)
+  library(themis)
+  library(glmnet)
+  library(ranger)
+  library(yardstick)
+  library(knitr)
+})
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  comment = "##",
+  dev = "png",
+  dpi = 300,
+  fig.align = "center",
+  out.width = "\\linewidth"
+)
+
+library(kableExtra)
+
+options(knitr.table.format = "latex")
+options(warn = -1, width = 80)
+
+xgboost_disponible <- requireNamespace("xgboost", quietly = TRUE)
+if (xgboost_disponible) {
+  library(xgboost)
+}
+
+set.seed(42)
+
+preparer_valeur_table <- function(x) {
+  x <- ifelse(is.na(x), "NA", as.character(x))
+  x
+}
+
+echapper_latex <- function(x) {
+  x <- preparer_valeur_table(x)
+  x <- gsub("\\\\", "\\\\textbackslash{}", x)
+  x <- gsub("([#$%&_{}])", "\\\\\\1", x, perl = TRUE)
+  x <- gsub("~", "\\\\textasciitilde{}", x, fixed = TRUE)
+  x <- gsub("\\^", "\\\\textasciicircum{}", x, perl = TRUE)
+  x
+}
+
+ajouter_points_cesure <- function(x) {
+  x <- preparer_valeur_table(x)
+  x <- gsub("__", "__ ", x, fixed = TRUE)
+  x <- gsub("_", "_ ", x, fixed = TRUE)
+  x <- gsub(";", "; ", x, fixed = TRUE)
+  x <- gsub(",", ", ", x, fixed = TRUE)
+  x <- gsub("=", " = ", x, fixed = TRUE)
+  x <- gsub("\\(", "( ", x)
+  x <- gsub("\\)", " )", x)
+  x <- gsub("\\[", "[ ", x)
+  x <- gsub("\\]", " ]", x)
+  x
+}
+
+resume_valeurs_uniques <- function(x) {
+  x <- preparer_valeur_table(unique(x))
+  paste(x, collapse = ", ")
+}
+
+formater_cellules_table <- function(x) {
+  x <- ajouter_points_cesure(x)
+  echapper_latex(x)
+}
+
+afficher_tableau_pdf <- function(df,
+                                 colonnes_a_enrouler = integer(0),
+                                 largeurs = NULL,
+                                 font_size = 8,
+                                 col_names = names(df)) {
+  df_aff <- df
+
+  for (j in seq_along(df_aff)) {
+    if (is.character(df_aff[[j]]) || is.factor(df_aff[[j]])) {
+      if (length(colonnes_a_enrouler) == 0 || j %in% colonnes_a_enrouler) {
+        df_aff[[j]] <- formater_cellules_table(df_aff[[j]])
+      } else {
+        df_aff[[j]] <- echapper_latex(df_aff[[j]])
+      }
+    }
+  }
+
+  col_names_aff <- echapper_latex(col_names)
+
+  tab <- knitr::kable(
+    df_aff,
+    format = "latex",
+    booktabs = TRUE,
+    longtable = FALSE,
+    linesep = "",
+    escape = FALSE,
+    col.names = col_names_aff,
+    align = rep("l", ncol(df_aff))
+  ) %>%
+    kableExtra::kable_styling(
+      latex_options = c("hold_position"),
+      font_size = font_size,
+      full_width = FALSE,
+      position = "center"
+    )
+
+  if (!is.null(largeurs)) {
+    for (j in seq_along(largeurs)) {
+      tab <- tab %>% kableExtra::column_spec(j, width = largeurs[j])
+    }
+  }
+
+  tab
+}
+
+calculer_pr_auc <- function(y_vrai, y_proba) {
+  # Équivalent de `average_precision_score` de scikit-learn.
+  # On ordonne les observations par probabilité décroissante puis on moyenne
+  # la précision observée à chaque rang où l'étiquette vraie vaut 1.
+  y_bin <- as.integer(y_vrai == 1)
+
+  if (sum(y_bin) == 0) {
+    return(0)
+  }
+
+  ordre <- order(y_proba, decreasing = TRUE)
+  y_tries <- y_bin[ordre]
+
+  tp_cumules <- cumsum(y_tries)
+  precision_aux_rangs <- tp_cumules / seq_along(y_tries)
+
+  sum(precision_aux_rangs[y_tries == 1]) / sum(y_tries)
+}
+
+calculer_points_precision_rappel <- function(y_vrai, y_proba) {
+  # Approximation fidèle de la logique de precision_recall_curve de sklearn
+  # pour associer à chaque seuil : précision, rappel et F1.
+  y_bin <- as.integer(y_vrai == 1)
+  seuils <- sort(unique(y_proba))
+
+  purrr::map_dfr(seuils, function(seuil) {
+    y_pred <- ifelse(y_proba >= seuil, 1, 0)
+    tibble(
+      seuil = seuil,
+      precision = calculer_precision(y_vrai, y_pred),
+      recall = calculer_recall(y_vrai, y_pred),
+      f1 = calculer_f1(y_vrai, y_pred)
+    )
+  })
+}
+
+calculer_roc_auc <- function(y_vrai, y_proba) {
+  y_facteur <- factor(ifelse(y_vrai == 1, "yes", "no"), levels = c("no", "yes"))
+  yardstick::roc_auc_vec(truth = y_facteur, estimate = y_proba, event_level = "second")
+}
+
+calculer_precision <- function(y_vrai, y_pred) {
+  y_vrai_f <- factor(ifelse(y_vrai == 1, "yes", "no"), levels = c("no", "yes"))
+  y_pred_f <- factor(ifelse(y_pred == 1, "yes", "no"), levels = c("no", "yes"))
+  yardstick::precision_vec(truth = y_vrai_f, estimate = y_pred_f, event_level = "second")
+}
+
+calculer_recall <- function(y_vrai, y_pred) {
+  y_vrai_f <- factor(ifelse(y_vrai == 1, "yes", "no"), levels = c("no", "yes"))
+  y_pred_f <- factor(ifelse(y_pred == 1, "yes", "no"), levels = c("no", "yes"))
+  yardstick::recall_vec(truth = y_vrai_f, estimate = y_pred_f, event_level = "second")
+}
+
+calculer_f1 <- function(y_vrai, y_pred) {
+  y_vrai_f <- factor(ifelse(y_vrai == 1, "yes", "no"), levels = c("no", "yes"))
+  y_pred_f <- factor(ifelse(y_pred == 1, "yes", "no"), levels = c("no", "yes"))
+  yardstick::f_meas_vec(truth = y_vrai_f, estimate = y_pred_f, event_level = "second")
+}
+
+calculer_lift_recall_top20 <- function(y_vrai, y_proba, proportion = 0.20) {
+  resultat <- tibble(y = y_vrai, proba = y_proba) %>%
+    arrange(desc(proba))
+
+  n_top <- ceiling(nrow(resultat) * proportion)
+  top20 <- resultat %>% slice(1:n_top)
+
+  taux_base <- mean(resultat$y)
+  taux_top20 <- mean(top20$y)
+  lift_top_20 <- ifelse(taux_base > 0, taux_top20 / taux_base, 0)
+
+  total_positifs <- sum(resultat$y)
+  positifs_top20 <- sum(top20$y)
+  recall_top_20 <- ifelse(total_positifs > 0, positifs_top20 / total_positifs, 0)
+
+  list(
+    lift_top_20 = lift_top_20,
+    recall_top_20 = recall_top_20
+  )
+}
+
+creer_splits_temporels <- function(n, n_splits = 3) {
+  test_size <- floor(n / (n_splits + 1))
+  reste <- n %% (n_splits + 1)
+  splits <- vector("list", n_splits)
+
+  for (i in seq_len(n_splits)) {
+    fin_train <- i * test_size + reste
+    debut_test <- fin_train + 1
+    fin_test <- min(debut_test + test_size - 1, n)
+
+    splits[[i]] <- list(
+      train = seq_len(fin_train),
+      test = seq(debut_test, fin_test)
+    )
+  }
+
+  splits
+}
+
+preparer_dataframe_modele <- function(df, colonnes_categorielles) {
+  df2 <- df
+  df2[colonnes_categorielles] <- lapply(df2[colonnes_categorielles], as.factor)
+  df2$y <- factor(df2$y, levels = c(0, 1), labels = c("no", "yes"))
+  df2
+}
+
+construire_recette <- function(df, colonnes_numeriques, avec_scaler = TRUE, avec_smote = FALSE, k_neighbors = 5) {
+
+  colonnes_numeriques_presentes <- intersect(colonnes_numeriques, names(df))
+
+  colonnes_numeriques_a_normaliser <- colonnes_numeriques_presentes[
+    vapply(df[colonnes_numeriques_presentes], function(x) {
+      x_non_na <- x[!is.na(x)]
+      length(x_non_na) > 1 && dplyr::n_distinct(x_non_na) > 1
+    }, logical(1))
+  ]
+
+  rec <- recipe(y ~ ., data = df) %>%
+    step_novel(all_nominal_predictors())
+
+  if (avec_scaler && length(colonnes_numeriques_a_normaliser) > 0) {
+    rec <- rec %>%
+      step_normalize(all_of(colonnes_numeriques_a_normaliser))
+  }
+
+  rec <- rec %>%
+    step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+    step_zv(all_predictors())
+
+  if (avec_smote) {
+    rec <- rec %>%
+      step_smote(y, neighbors = k_neighbors)
+  }
+
+  rec
+}
+
+ajuster_modele <- function(nom_modele, train_df, params, colonnes_numeriques, colonnes_categorielles, ratio_positif) {
+  train_df2 <- preparer_dataframe_modele(train_df, colonnes_categorielles)
+
+  avec_scaler <- nom_modele %in% c("logistique_class_weight", "logistique_smote")
+  avec_smote <- nom_modele == "logistique_smote"
+  k_neighbors <- if ("smote__k_neighbors" %in% names(params)) params[["smote__k_neighbors"]] else 5
+
+  recette <- construire_recette(
+    df = train_df2,
+    colonnes_numeriques = colonnes_numeriques,
+    avec_scaler = avec_scaler,
+    avec_smote = avec_smote,
+    k_neighbors = k_neighbors
+  )
+
+  recette_prep <- prep(recette, training = train_df2, retain = TRUE)
+  train_baked <- bake(recette_prep, new_data = NULL)
+
+  x_train <- train_baked %>% select(-y)
+  y_train_num <- ifelse(train_baked$y == "yes", 1, 0)
+
+  if (nom_modele == "logistique_class_weight") {
+    alpha <- ifelse(params[["modele__penalty"]] == "l1", 1, 0)
+
+    lambda <- 1 / (nrow(x_train) * params[["modele__C"]])
+
+    n_obs <- length(y_train_num)
+    poids_no <- n_obs / (2 * sum(y_train_num == 0))
+    poids_yes <- n_obs / (2 * sum(y_train_num == 1))
+    poids_obs <- ifelse(y_train_num == 1, poids_yes, poids_no)
+
+    modele <- glmnet(
+      x = as.matrix(x_train),
+      y = y_train_num,
+      family = "binomial",
+      alpha = alpha,
+      lambda = lambda,
+      weights = poids_obs,
+      standardize = FALSE
+    )}
+  
+  else if (nom_modele == "logistique_smote") {
+    alpha <- ifelse(params[["modele__penalty"]] == "l1", 1, 0)
+    lambda <- 1 / (nrow(x_train) * params[["modele__C"]])
+
+    modele <- glmnet(
+      x = as.matrix(x_train),
+      y = y_train_num,
+      family = "binomial",
+      alpha = alpha,
+      lambda = lambda,
+      standardize = FALSE
+    )
+
+  } 
+  
+  else if (nom_modele == "random_forest") {
+    p <- ncol(x_train)
+    max_features <- params[["modele__max_features"]]
+    mtry_val <- if (identical(max_features, "sqrt")) {
+      max(1, floor(sqrt(p)))
+    } else {
+      max(1, floor(as.numeric(max_features) * p))
+    }
+
+    min_node_val <- max(
+      params[["modele__min_samples_leaf"]],
+      ceiling(params[["modele__min_samples_split"]] / 2)
+    )
+
+    train_rf <- bind_cols(
+      y = factor(ifelse(y_train_num == 1, "yes", "no"), levels = c("no", "yes")),
+      x_train
+    )
+
+    n_obs_rf <- nrow(train_rf)
+    poids_no <- n_obs_rf / (2 * sum(train_rf$y == "no"))
+    poids_yes <- n_obs_rf / (2 * sum(train_rf$y == "yes"))
+
+    args_rf <- list(
+      formula = y ~ .,
+      data = train_rf,
+      probability = TRUE,
+      num.trees = params[["modele__n_estimators"]],
+      min.node.size = min_node_val,
+      mtry = mtry_val,
+      class.weights = c(no = poids_no, yes = poids_yes),
+      seed = 42
+    )
+
+    if (!is.na(params[["modele__max_depth"]])) {
+      args_rf$max.depth <- params[["modele__max_depth"]]
+    }
+
+    modele <- do.call(ranger::ranger, args_rf)
+
+  } 
+  
+  else if (nom_modele == "xgboost") {
+    dtrain <- xgboost::xgb.DMatrix(
+      data = as.matrix(x_train),
+      label = y_train_num
+    )
+
+    params_xgb <- list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = params[["modele__max_depth"]],
+      eta = params[["modele__learning_rate"]],
+      subsample = params[["modele__subsample"]],
+      colsample_bytree = params[["modele__colsample_bytree"]],
+      scale_pos_weight = ratio_positif
+    )
+
+    modele <- xgboost::xgb.train(
+      params = params_xgb,
+      data = dtrain,
+      nrounds = params[["modele__n_estimators"]],
+      verbose = 0
+    )
+
+  } 
+  
+  else {
+    stop("Modèle non reconnu.")
+  }
+
+  list(
+    nom_modele = nom_modele,
+    modele = modele,
+    recette = recette_prep,
+    colonnes_categorielles = colonnes_categorielles
+  )
+}
+
+predire_proba <- function(objet_modele, new_df) {
+  new_df2 <- new_df
+  new_df2[objet_modele$colonnes_categorielles] <- lapply(
+    new_df2[objet_modele$colonnes_categorielles],
+    as.factor
+  )
+
+  if ("y" %in% names(new_df2)) {
+    new_df2$y <- factor(new_df2$y, levels = c(0, 1), labels = c("no", "yes"))
+  }
+
+  new_baked <- bake(objet_modele$recette, new_data = new_df2)
+
+  if ("y" %in% names(new_baked)) {
+    x_new <- new_baked %>% select(-y)
+  } else {
+    x_new <- new_baked
+  }
+
+  if (objet_modele$nom_modele %in% c("logistique_class_weight", "logistique_smote")) {
+    proba <- as.numeric(
+      predict(objet_modele$modele, newx = as.matrix(x_new), type = "response")[, 1]
+    )
+
+  } else if (objet_modele$nom_modele == "random_forest") {
+    proba <- as.numeric(
+      predict(objet_modele$modele, data = x_new)$predictions[, "yes"]
+    )
+
+  } else if (objet_modele$nom_modele == "xgboost") {
+    proba <- as.numeric(
+      predict(objet_modele$modele, newdata = as.matrix(x_new))
+    )
+
+  } else {
+    stop("Modèle non reconnu.")
+  }
+
+  proba
+}
+
+evaluer_cv <- function(nom_modele, grille_parametres, train_df, splits, colonnes_numeriques, colonnes_categorielles, ratio_positif) {
+  scores <- numeric(length(splits))
+
+  for (i in seq_along(splits)) {
+    split_i <- splits[[i]]
+    train_fold <- train_df[split_i$train, , drop = FALSE]
+    valid_fold <- train_df[split_i$test, , drop = FALSE]
+
+    modele_i <- ajuster_modele(
+      nom_modele = nom_modele,
+      train_df = train_fold,
+      params = grille_parametres,
+      colonnes_numeriques = colonnes_numeriques,
+      colonnes_categorielles = colonnes_categorielles,
+      ratio_positif = ratio_positif
+    )
+
+    y_proba_fold <- predire_proba(modele_i, valid_fold)
+    scores[i] <- calculer_pr_auc(valid_fold$y, y_proba_fold)
+  }
+
+  mean(scores, na.rm = TRUE)
+}
+
+optimiser_modele <- function(nom_modele, infos, train_df, splits, colonnes_numeriques, colonnes_categorielles, ratio_positif) {
+  grille <- infos$parametres
+
+  if (infos$type_recherche == "random" && !is.null(infos$n_iter) && nrow(grille) > infos$n_iter) {
+    grille_utilisee <- grille %>% slice_sample(n = infos$n_iter)
+  } else {
+    grille_utilisee <- grille
+  }
+
+  meilleur_score <- -Inf
+  meilleurs_parametres <- NULL
+  lignes_resultats <- vector("list", nrow(grille_utilisee))
+
+  for (i in seq_len(nrow(grille_utilisee))) {
+    params_i <- as.list(grille_utilisee[i, , drop = FALSE])
+    score_i <- evaluer_cv(
+      nom_modele = nom_modele,
+      grille_parametres = params_i,
+      train_df = train_df,
+      splits = splits,
+      colonnes_numeriques = colonnes_numeriques,
+      colonnes_categorielles = colonnes_categorielles,
+      ratio_positif = ratio_positif
+    )
+
+    lignes_resultats[[i]] <- tibble(
+      modele = nom_modele,
+      iteration = i,
+      pr_auc_cv = score_i,
+      parametres = paste(names(params_i), unlist(params_i), sep = "=", collapse = " ; ")
+    )
+
+    if (score_i > meilleur_score) {
+      meilleur_score <- score_i
+      meilleurs_parametres <- params_i
+    }
+  }
+
+  meilleur_modele <- ajuster_modele(
+    nom_modele = nom_modele,
+    train_df = train_df,
+    params = meilleurs_parametres,
+    colonnes_numeriques = colonnes_numeriques,
+    colonnes_categorielles = colonnes_categorielles,
+    ratio_positif = ratio_positif
+  )
+
+  list(
+    best_score = meilleur_score,
+    best_params = meilleurs_parametres,
+    best_model = meilleur_modele,
+    details = bind_rows(lignes_resultats)
+  )
+}
+
+choisir_seuil_f1 <- function(y_vrai, y_proba) {
+  tableau <- calculer_points_precision_rappel(y_vrai, y_proba) %>%
+    arrange(desc(f1), desc(precision), desc(recall))
+
+  list(
+    seuil = tableau$seuil[1],
+    tableau = tableau
+  )
+}
+```
+
+
+## ETAPE 1: COMPREHENSION METIER
+
+**OBJECTIF PRINCIPAL :** Une banque a mené des campagnes téléphoniques pour convaincre ses clients de souscrire à un dépôt à terme. Notre objectif est de construire un modèle capable de prédire si un client va souscrire (**yes**) ou non (**no**).
+
+**OBJECTIF METIER :** La banque veut utiliser les données des anciennes campagnes pour sélectionner les clients à cibler et les contacter par ordre de priorité, afin d’augmenter les souscriptions tout en limitant les coûts. On garde donc une approche relativement équilibrée.
+
+**1.1. Quelle est la variable cible?**
+   -  Notre Variable cible est **y**
+       - La variable cible **y** indique si un client a souscrit à un dépôt à terme (**yes** ou **no**)
+   - L'intérêt métier : mieux cibler les clients susceptibles d'accepter l'offre, nous permettant ainsi de limiter les coûts.
+
+**1.2- A quel type de probleme avons-nous a faire**: 
+   - C'est un problème de **classification binaire** car on predit une variable à 2 catégories: **yes**/**no**
+
+**1.3- Que représente la campagne marketing?**
+   - Chaque ligne de nos données represente un appel téléphonique. La banque a donc appelé 41188 clients pour leur proposer l'offre.
+   - un **yes** ou **no** dans la variable cible signifie:
+      - **yes** : le client a **accepté** l'offre
+      - **no** : le client a **réfusé** l'offre
+
+## ETAPE 2: COMPREHENSION DES DONNEES
+
+Notre objectif ici sera de trouver les problemes liés aux données à savoir s'il y'a des données manquantes, des valeurs aberrantes et mieux connaitre les differentes variables
+
+**Chargement des données**
+
+```{r}
+CHEMIN_FICHIER <- "bank-additional-full.csv"
+
+Cestia <- read_delim(CHEMIN_FICHIER, delim = ";", show_col_types = FALSE)
+head(Cestia)
+```
+
+**2.1- la taille du dataset?**
+
+```{r}
+dim(Cestia)
+```
+
+- on dispose :
+     - **41188** lignes
+     - **21** colonnes
+
+**2.2- Les types de variables:**
+
+```{r}
+tibble(
+  variable = names(Cestia),
+  type = sapply(Cestia, function(x) class(x)[1])
+)
+```
+
+- on dispose: 
+     - **10** variables **numériques**
+     - **10** variables **catégorielles** + la variables **Cible**
+
+**2.3- les valeurs manquantes**
+
+```{r}
+colSums(is.na(Cestia))
+```
+
+- Nous n'avons pas de données manquantes de **types NaN**
+
+**2.4- Verifions si nous disposons de valeurs manquantes de types unknown**
+
+```{r}
+compter_unknown <- sapply(Cestia, function(x) {
+  if (is.character(x) || is.factor(x)) {
+    sum(x == "unknown", na.rm = TRUE)
+  } else {
+    0
+  }
+})
+
+compter_unknown
+```
+
+- Nous disposons bien des valeurs manquantes de types **unknown** dans les variables: 
+   - job
+   - marital
+   - education
+   - default
+   - housing
+   - loan
+- **Décision**: Nous gardons **unknown** comme catégorie à part entière
+parce que **défault** = 8597 soit environ **21%**. On ne peut donc pas supprimer ses lignes car nous nous exposons à de la perte d'informations.
+
+**2.5- verifions et affichons les doublons**
+
+```{r}
+nombre_doublons <- sum(duplicated(Cestia)); nombre_doublons
+```
+
+- Notre dataset dispose de **12 doublons**
+
+**2.6- Distribution de la variable Cible y**
+
+```{r}
+count(Cestia, y, sort = TRUE)
+```
+
+**Graphique**
+
+```{r}
+count(Cestia, y) %>%
+  ggplot(aes(x = y, y = n, fill = y)) +
+  geom_col() +
+  labs(
+    title = "Distribution de la variable cible y",
+    x = "Souscription",
+    y = "Nombre de clients"
+  ) +
+  scale_fill_manual(values = c("no" = "red", "yes" = "steelblue")) +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+-  **no** est 7,9 fois plus fréquent que **yes**
+- Le dataset est donc **déséquilibré**. Cela veut dire que l'accuracy seule peut être trompeuse.
+- Pour comparer les modèles, nous regarderons surtout la **PR-AUC**.
+- Pour le choix du seuil, nous regarderons ensuite la **précision**, le **rappel** et le **F1-score**.
+- Enfin, pour la valeur métier, nous regarderons le **Lift@20%** et le **Recall@20%**.
+
+**2.7. Vérifions l'existence des valeurs aberrantes dans le jeu de données**
+
+**Statistique descriptive**
+
+```{r}
+summary(select(Cestia, where(is.numeric)))
+```
+
+**ÂGE**
+
+```{r}
+ggplot(Cestia, aes(y = age)) +
+  geom_boxplot() +
+  labs(y = "age") +
+  theme_minimal()
+```
+
+- **ÂGE**:
+    - l'âge minimum d'un client est **17** et l'âge maximum est **98** 
+    - la majorité des clients ont entre **32** et **47 ans**
+    - **la Variable Âge a 469 valeurs aberrantes**
+
+**DURATION**
+
+```{r}
+ggplot(Cestia, aes(y = duration)) +
+  geom_boxplot() +
+  labs(y = "duration") +
+  theme_minimal()
+```
+
+- **DURATION**:
+    - 75% des appels durent moins de **319 secondes**
+    - mais un appel peut durer **4918**
+    - **On devra supprimer la variable duration car elle est connue qu'après un appel**
+
+**CAMPAIGN**
+
+```{r}
+ggplot(Cestia, aes(y = campaign)) +
+  geom_boxplot() +
+  labs(y = "campaign") +
+  theme_minimal()
+```
+
+- **campaign**:
+    - la plupart des clients sont contactés **1** à **3 fois**
+    - mais certains **56 fois**
+    - **56 est une valeur aberrante**
+
+**PDAYS**
+
+```{r}
+ggplot(Cestia, aes(y = pdays)) +
+  geom_boxplot() +
+  labs(y = "pdays") +
+  theme_minimal()
+```
+
+- pdays = 999 : signifie "jamais contacté avant" . Ce n'est pas une vraie valeur numérique
+- 39673 clients ont cette valeur. À traiter comme catégorie ou indicateur binaire
+
+**2.8- Coorelation des variables explicatives avec la variable cible**
+
+```{r}
+Cestia <- Cestia %>% mutate(y_numerique = if_else(y == "yes", 1, 0))
+```
+
+**Colonnes numériques**
+
+```{r}
+colonnes_numerique <- names(Cestia)[sapply(Cestia, is.numeric)]
+colonnes_numerique <- setdiff(colonnes_numerique, "y_numerique")
+colonnes_numerique
+```
+
+**Correlation avec la variable cible**
+
+```{r}
+matrice_corr <- Cestia %>%
+  select(all_of(c(colonnes_numerique, "y_numerique"))) %>%
+  cor(use = "complete.obs")
+
+correlation <- matrice_corr[rownames(matrice_corr) != "y_numerique", "y_numerique"]
+correlation
+```
+
+**Taux de souscription par mois**
+
+```{r}
+taux_mois <- Cestia %>%
+  group_by(month) %>%
+  summarise(taux = mean(y_numerique), .groups = "drop")
+
+print(taux_mois %>% mutate(taux = round(taux * 100, 2)))
+
+taux_mois %>%
+  ggplot(aes(x = month, y = taux * 100)) +
+  geom_col() +
+  labs(title = "Taux de souscription par mois", y = "%", x = "month") +
+  theme_minimal()
+```
+
+**Taux de souscription par metier**
+
+```{r}
+taux_metier <- Cestia %>%
+  group_by(job) %>%
+  summarise(taux = mean(y_numerique), .groups = "drop")
+
+print(taux_metier %>% mutate(taux = round(taux * 100, 2)))
+
+taux_metier %>%
+  ggplot(aes(x = taux * 100, y = reorder(job, taux))) +
+  geom_col() +
+  labs(title = "Taux de souscription par métier", x = "%", y = "job") +
+  theme_minimal()
+```
+
+**correlation avec la varible cible**
+
+```{r}
+cor_df <- tibble(
+  variable = names(correlation),
+  correlation = as.numeric(correlation)
+) %>%
+  filter(!is.na(correlation)) %>%
+  arrange(correlation)
+
+cor_df$variable <- factor(cor_df$variable, levels = cor_df$variable)
+
+ggplot(cor_df, aes(x = correlation, y = variable)) +
+  geom_col() +
+  labs(title = "Corrélation avec y", x = "Corrélation", y = NULL) +
+  theme_minimal()
+```
+
+**visualisation de la variable unknown**
+
+```{r}
+unknown <- sapply(Cestia %>% select(where(~ is.character(.x) || is.factor(.x))), function(x) {
+  sum(x == "unknown", na.rm = TRUE)
+})
+
+unknown <- unknown[unknown > 0]
+
+tibble(
+  variable = names(unknown),
+  n = as.numeric(unknown)
+) %>%
+  ggplot(aes(x = n, y = reorder(variable, n))) +
+  geom_col() +
+  labs(title = "Valeurs 'unknown' par variable", x = "Nombre", y = NULL) +
+  theme_minimal()
+```
+
+**Conclusion partielle:**
+- Nous gardons 'unknown' comme catégorie à cause de **default** = 8597)
+ 
+- Valeurs aberrantes :
+     - Supprimer la variable **duration** car elle crée une fuite de données
+     - Créer une variable binaire **contacted_before** et une variable **pdays_clean** pour mieux traiter **pdays** 
+- La variable cible étant déséquilibrée, on utilise F1-score pour un compromis entre précision et rappell, et PR-AUC pour la sélection du modèle.
+ 
+- Variables importantes identifiées :
+     - duration (*correlation = 0.41*)
+     - nr.employed (*correlation = -0.36*)
+     - euribor3m (*correlation = -0.31*)
+     - *mars, décembre, septembre et octobre* ont un **taux > 40%**
+     - taux de souscription par job : **student (31%), retired (25%)**
+
+## ETAPE 3: PREPARATION DES DONNEES
+
+**3.1 – Repartons du dataset brut**
+
+```{r}
+Cestia_modele <- Cestia
+cat("Taille initiale :", dim(Cestia_modele), "
+")
+```
+
+**3.2 – Supprimons les doublons**
+
+```{r}
+cat("Lignes avant suppression des doublons :", nrow(Cestia_modele), "
+")
+Cestia_modele <- distinct(Cestia_modele)
+cat("Lignes après suppression des doublons  :", nrow(Cestia_modele), "
+")
+```
+
+**3.3 – Supprimons les variables qui posent problème pour une prédiction avant la campagne**
+
+```{r}
+colonnes_a_supprimer <- c("duration", "campaign")
+Cestia_modele <- Cestia_modele %>% select(-all_of(colonnes_a_supprimer))
+cat("Colonnes supprimées :", paste(colonnes_a_supprimer, collapse = ", "), "
+")
+cat("Nouvelle taille :", dim(Cestia_modele), "
+")
+```
+
+- **duration** est connue après l’appel, donc elle crée une fuite de données.
+- **campaign** dépend de la campagne en cours, donc elle n’est pas cohérente avec notre objectif de prédiction avant l’action commerciale.
+
+**3.4 – Transformons la variable pdays**
+
+```{r}
+Cestia_modele <- Cestia_modele %>%
+  mutate(
+    contacted_before = if_else(pdays != 999, 1, 0),
+    pdays_clean = if_else(pdays < 999, pdays, 999)
+  ) %>%
+  select(-pdays)
+
+head(Cestia_modele %>% select(contacted_before, pdays_clean))
+count(Cestia_modele, contacted_before)
+```
+
+- Ici, **999** signifie en réalité “jamais contacté auparavant”.
+- On transforme donc **pdays** en deux informations plus lisibles :
+    - **contacted_before** : le client a-t-il déjà été contacté ?
+    - **pdays_clean** : nombre de jours si l’information existe.
+
+**3.5 – Encodons la variable cible y**
+
+```{r}
+Cestia_modele <- Cestia_modele %>%
+  mutate(y = if_else(y == "yes", 1, 0))
+
+cat("Répartition finale de la cible :
+")
+print(count(Cestia_modele, y))
+
+cat("
+Proportions :
+")
+print(prop.table(table(Cestia_modele$y)) %>% round(4))
+```
+
+**3.6 – Regroupons les mois en saisons**
+
+```{r}
+saison_temporelle <- c(
+  "mar" = "printemps", "apr" = "printemps", "may" = "printemps",
+  "jun" = "ete", "jul" = "ete", "aug" = "ete",
+  "sep" = "automne", "oct" = "automne", "nov" = "automne",
+  "dec" = "hiver", "jan" = "hiver", "feb" = "hiver"
+)
+
+Cestia_modele <- Cestia_modele %>%
+  mutate(saison = recode(month, !!!saison_temporelle))
+
+count(Cestia_modele, saison, sort = TRUE)
+```
+
+- Cette transformation simplifie la variable **month**.
+- Elle permet de garder l’idée du moment de l’année, tout en réduisant le nombre de catégories.
+
+**3.7 – Regroupons les niveaux d’éducation**
+
+```{r}
+education_niveaux <- c(
+  "illiterate" = "bas",
+  "basic.4y" = "bas",
+  "basic.6y" = "bas",
+  "basic.9y" = "moyen",
+  "high.school" = "moyen",
+  "professional.course" = "moyen",
+  "university.degree" = "haut",
+  "unknown" = "unknown"
+)
+
+Cestia_modele <- Cestia_modele %>%
+  mutate(education_niveau = recode(education, !!!education_niveaux))
+
+count(Cestia_modele, education_niveau, sort = TRUE)
+```
+
+- Cela rend la variable plus simple à lire.
+- Cela évite aussi d’avoir trop de petites modalités séparées.
+
+**3.8 – Choisissons les variables finales**
+
+```{r}
+colonnes_finales <- c(
+  "age",
+  "job",
+  "marital",
+  "education_niveau",
+  "default",
+  "housing",
+  "loan",
+  "contact",
+  "saison",
+  "day_of_week",
+  "previous",
+  "poutcome",
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "euribor3m",
+  "nr.employed",
+  "contacted_before",
+  "pdays_clean",
+  "y"
+)
+
+Cestia_modele <- Cestia_modele %>% select(all_of(colonnes_finales))
+cat("Taille du dataset final de modélisation :", dim(Cestia_modele), "
+")
+head(Cestia_modele)
+```
+
+- Pour la version finale, on garde les variables utiles avant campagne.
+- On remplace **month** par **saison** et **education** par **education_niveau** pour simplifier le jeu de données.
+
+**3.9 – Séparons les données dans l’ordre du temps : train / validation / test**
+
+```{r}
+n <- nrow(Cestia_modele)
+fin_train <- floor(0.70 * n)
+fin_valid <- floor(0.85 * n)
+
+train <- Cestia_modele[1:fin_train, , drop = FALSE]
+valid <- Cestia_modele[(fin_train + 1):fin_valid, , drop = FALSE]
+test <- Cestia_modele[(fin_valid + 1):n, , drop = FALSE]
+
+cat("Train :", dim(train), "
+")
+cat("Validation :", dim(valid), "
+")
+cat("Test :", dim(test), "
+")
+```
+
+- Ici, on **ne mélange pas les lignes**.
+- Le but est de respecter l’ordre temporel du dataset : on apprend sur le passé, puis on valide sur des observations plus récentes, et on garde le test pour la fin.
+
+**3.10 – Séparons X et y**
+
+```{r}
+X_train <- train %>% select(-y)
+y_train <- train$y
+
+X_valid <- valid %>% select(-y)
+y_valid <- valid$y
+
+X_test <- test %>% select(-y)
+y_test <- test$y
+
+cat("Taille X_train :", dim(X_train), "
+")
+cat("Taille X_valid :", dim(X_valid), "
+")
+cat("Taille X_test  :", dim(X_test), "
+")
+```
+
+**3.11 – Définissons les colonnes numériques et catégorielles**
+
+```{r}
+colonnes_numeriques <- c(
+  "age",
+  "previous",
+  "emp.var.rate",
+  "cons.price.idx",
+  "cons.conf.idx",
+  "euribor3m",
+  "nr.employed",
+  "contacted_before",
+  "pdays_clean"
+)
+
+colonnes_categorielles <- c(
+  "job",
+  "marital",
+  "education_niveau",
+  "default",
+  "housing",
+  "loan",
+  "contact",
+  "saison",
+  "day_of_week",
+  "poutcome"
+)
+
+cat("Nombre de variables numériques :", length(colonnes_numeriques), "
+")
+cat("Nombre de variables catégorielles :", length(colonnes_categorielles), "
+")
+```
+
+## ETAPE 4: ENTRAINER LES MODELES
+
+Dans cette partie, nous allons parlerons des modèles choisis et nous les comparerons.
+
+### Les modèles choisis
+Les modèles retenus pour notre études sont les suivants: 
+- La **regression logistique** 
+- **Random Forest**
+- **XGBOOST**
+
+Le choix de ces trois algorithmes permet de couvrir le large spectre de la modélisation statistique.
+
+Étant face à un problème de **classification binaire**, l'idée est de commencer avec une **approche linéaire**(**regression logistique**) pour sa simplicité et son interprétabilité. 
+
+Par la suite, nous évaluerons les approches par **agrégration parallèle**(**Random forest**) et par **optimisation séquentielle**(**XGBOOST**); 
+
+L'approche par agrégation parallèle ayant pour particularité d'être stable et robuste face au bruit, et celle par optimisation séquentielle la particularité d'être performante avec des données tabulaires.
+
+### 4.1 – Régression logistique
+
+**Définition :**  
+La régression logistique est un modèle linéaire de classification. 
+Elle ne prédit pas directement une classe **no** ou **yes**, mais la probabilité qu'un événement appartienne à la classe **yes**.
+
+Elle se fait en deux étapes:
+- **étape 1 : le score linéaire ($z$) .** On calcule d'abord une somme pondérée des variables:  $$z = \beta_0 + \beta_1x_1 + \beta_2x_2 + ... + \beta_nx_n$$
+
+où $x_1, x_2, ...$ sont les données d'entrée (*features*) et $\beta_0$ est la valeur moyenne estimée de la variable $z$ lorsque les variables explicatives sont nulles; $\beta_1, \beta_2, ...$ sont les poids.
+
+
+- **étape 2 : La fonction Sigmoïde $\sigma$.** 
+On transforme  ce score $z$ en une probabilité entre 0 et 1 grâce à la fonction logistique : 
+$$\sigma(z) = \frac{1}{1 + e^{-z}} = P(y=1)$$
+
+$y$ étant la valeur de la cible **0** pour **non/no** et **1** pour **oui/yes**.
+
+
+**Comment elle est appliquée dans notre cas?** 
+
+Nous allons faire la regréssion logistique de deux façons:
+
+**- Régression logistique avec classes équilibrées**
+
+
+Ici, les variables numériques sont d'abord standardisées.
+Ensuite, les variables catégorielles sont encodées en One Hot Encoding. 
+
+Enfin, on cherche les meilleurs hyperparamètres `C` et `penalty`.
+
+**Hyperparamètres testés :**
+- `C`: C'est l'inverse de la force de régularisation. Elle mésure la pénalité appliquée aux poids des variables. Plus `C` est petit, plus la régularisation est forte.
+
+
+- `penalty`(l1, l2): c'est le type de régularisation appliqué au modèle. Elle définit comment on punit la complexité pour éviter le surapprentissage. 
+
+Quand on choisit l1(Lasso), on demande au modèle d'essayer de trouver les variables les plus importantes et d'ignorer les autres en mettant leur poids à zéro.
+
+Quand on choisit l2(Ridge), on demande au modèle de garder tous les coefficients mais de ne laisser aucun d'entre eux prendre plus d'importance.
+- `solver` : `saga`, c'est un paramètre qui permet au modèle de basculer librement entre les deux types de régularisation l1 et l2.
+
+
+- `class_weight` : `balanced`, c'est un paramètre qui permet de gérer le déséquilibre de la variable cible y. Concrètement, nous disons au modèle que faire une erreur sur un "yes" coûte beaucoup plus cher que de se tromper sur un "no".
+
+**- Régression logistique avec SMOTE**  
+
+SMOTE est une méthode qui crée artificiellement de nouveaux exemples de la classe minoritaire.
+
+SMOTE ne se contente pas de dupliquer les lignes existantes. Elle crée de nouveaux exemples synthétiques pour la classe minoritaire.
+
+D'abord, elle choisit un point de la classe minoritaire. Ensuite, elle identifie ses k plus proches voisins. Enfin, elle crée un nouveau point n'importe où sur la ligne imaginaire qui relie le point initial à l'un de ses voisins.
+ 
+
+
+**Hyperparamètres testés :**
+- `smote__k_neighbors` : les k plus proches voisins.
+- `modele__C` ou `C` 
+- `modele__penalty` : `["l1", "l2"]`
+- `solver` : `saga`
+
+### 4.2 – Random Forest
+
+**Définition :**  
+Mathématiquement, le Random Forest est une **agrégration** de plusieurs fonctions simples (arbres de décision).
+
+- **Arbres de décision $h(x)$ :**
+C'est une fonction qui sépare l'espace des données en "boîtes0" rectangulaires par des conditions logiques.
+
+- **La forêt $H(x)$ :**
+Si on a  $T$ arbres, la prédiction finale $\hat{y}$, est le **vote majoritaire** de tous les arbres:
+
+$$\hat{y} = \text{mode}\{h_1(x), h_2(x), ..., h_T(x)\} = H(x)$$
+
+
+**Comment il est appliqué dans notre cas?**  
+D'abord, on encode les variables catégorielles. Les variables numériques restent telles quelles. Enfin, on teste plusieurs profondeurs et tailles de forêt.
+
+**Hyperparamètres testés :**
+- `n_estimators` : le nombre d'arbres dans la forêt. Plus il y a d'arbres, plus le modèle est robuste. Cependant, au-delà d'un certain nombre, la performance stagne et le temps de calcul augmente.
+
+
+- `max_depth` : la profondeur maximale de chaque arbre. Un arbre trop profond va apprendre les détails.
+
+
+- `min_samples_split` : c'est le nombre minimal d'individus requis pour créer une nouvelle branche.
+
+
+- `min_samples_leaf` : c'est le nombre minimal d'individus pour constituer une feuille finale.
+
+
+- `max_features` : c'est le nombre de variables tirées au sort à chaque étape de construction de l'arbre.
+
+
+- `class_weight` : `balanced`
+
+### 4.3 – XGBoost (si disponible)
+
+**Définition :**  
+XGBoost, eXtreme Gradient Boosting est une bibliothèque de machine learning qui utilise les arbres de décision auxquels est appliqué le *boosting* de gradient.
+
+Le *boosting* de gradient est une méthode qui est utilisée pour réduire le nombre d'erreurs dans l'analyse prédictive des données.
+
+XGBoost est donc un assemblage d'arbres décisionnels qui prédisent les résidus, et corrige les erreurs des arbres décisionnels précédents.
+
+
+*Le résidu représente l'erreur entre la valeur réelle et la valeur prédite.*
+
+
+**Comment il est appliqué dans notre cas ?**  
+
+On commence également par l'encodage des variables catégorielles.
+
+Puis on calcule le ratio entre la classe négative et positive pour aider le modèle avec `scale_pos_weight`
+
+Enfin, on teste plusieurs profondeurs, nombres d'arbres et taux d'apprentissage.
+
+
+
+**Hyperparamètres testés :**
+- `n_estimators`
+- `max_depth`
+- `learning_rate` : c'est le "pas" d'apprentissage. C'est-à-dire à quel point on prend compte des corrections apportées par le nouvel arbre.
+
+- `subsample` : c'est la fraction de lignes(individus), utilisée pour chaque arbre.
+
+- `colsample_bytree` : c'est la fraction de colonnes(variables), utilisée par chaque arbre.
+
+`scale_pos_weight` : permet de mésurer le poids accordé à la classe positive.
+
+**4.4 – Construisons les préprocesseurs**
+
+```{r}
+preprocesseur_avec_scaler <- list(
+  variables_numeriques = colonnes_numeriques,
+  variables_categorielles = colonnes_categorielles,
+  standardisation = TRUE,
+  encodage = "one_hot"
+)
+
+preprocesseur_sans_scaler <- list(
+  variables_numeriques = colonnes_numeriques,
+  variables_categorielles = colonnes_categorielles,
+  standardisation = FALSE,
+  encodage = "one_hot"
+)
+
+cat("Préprocesseurs créés.
+")
+```
+
+**4.5 – Calculons le ratio de déséquilibre sur le train**
+
+```{r}
+nb_non <- sum(y_train == 0)
+nb_oui <- sum(y_train == 1)
+ratio_positif <- nb_non / nb_oui
+
+cat("Nombre de no sur le train :", nb_non, "
+")
+cat("Nombre de yes sur le train :", nb_oui, "
+")
+cat("Ratio no/yes :", round(ratio_positif, 2), "
+")
+```
+
+**4.6 – Construisons les pipelines des modèles**
+
+```{r}
+pipeline_logistique <- list(
+  preparation = preprocesseur_avec_scaler,
+  modele = "regression_logistique_ponderee"
+)
+
+pipeline_logistique_smote <- list(
+  preparation = preprocesseur_avec_scaler,
+  reequilibrage = "SMOTE",
+  modele = "regression_logistique"
+)
+
+pipeline_rf <- list(
+  preparation = preprocesseur_sans_scaler,
+  modele = "random_forest"
+)
+
+modeles <- list(
+  logistique_class_weight = list(
+    pipeline = pipeline_logistique,
+    parametres = tidyr::crossing(
+      `modele__C` = c(0.001, 0.01, 0.1, 1, 10),
+      `modele__penalty` = c("l1", "l2")
+    ),
+    type_recherche = "grid"
+  ),
+  logistique_smote = list(
+    pipeline = pipeline_logistique_smote,
+    parametres = tidyr::crossing(
+      `smote__k_neighbors` = c(3, 5, 7),
+      `modele__C` = c(0.01, 0.1, 1),
+      `modele__penalty` = c("l1", "l2")
+    ),
+    type_recherche = "grid"
+  ),
+  random_forest = list(
+    pipeline = pipeline_rf,
+    parametres = tidyr::crossing(
+      `modele__n_estimators` = c(200, 400),
+      `modele__max_depth` = c(5, 10, 20, NA),
+      `modele__min_samples_split` = c(2, 5, 10),
+      `modele__min_samples_leaf` = c(1, 2, 5),
+      `modele__max_features` = c("sqrt", "0.5")
+    ),
+    type_recherche = "random",
+    n_iter = 12
+  )
+)
+
+if (xgboost_disponible) {
+  pipeline_xgb <- list(
+    preparation = preprocesseur_sans_scaler,
+    modele = "xgboost"
+  )
+
+  modeles$xgboost <- list(
+    pipeline = pipeline_xgb,
+    parametres = tidyr::crossing(
+      `modele__n_estimators` = c(100, 200),
+      `modele__max_depth` = c(3, 5, 7),
+      `modele__learning_rate` = c(0.03, 0.1),
+      `modele__subsample` = c(0.8, 1.0),
+      `modele__colsample_bytree` = c(0.8, 1.0)
+    ),
+    type_recherche = "random",
+    n_iter = 10
+  )
+}
+
+cat("Modèles construits :", paste(names(modeles), collapse = ", "), "
+")
+```
+
+**4.7 – Récapitulatif des espaces d’hyperparamètres**
+
+```{r}
+lignes_hyper <- purrr::imap_dfr(modeles, function(infos, nom_modele) {
+  tibble(
+    modele = nom_modele,
+    hyperparametre = names(infos$parametres),
+    valeurs_testees = purrr::map_chr(infos$parametres, resume_valeurs_uniques)
+  )
+})
+
+tableau_hyper <- lignes_hyper
+afficher_tableau_pdf(
+  tableau_hyper,
+  colonnes_a_enrouler = c(2, 3),
+  largeurs = c("3cm", "4.2cm", "7cm"),
+  font_size = 7,
+  col_names = c("modèle", "hyperparamètre", "valeurs testées")
+)
+```
+
+**4.8 – Optimisons les hyperparamètres sur le jeu d’entraînement**
+
+```{r}
+splits_cv <- creer_splits_temporels(nrow(train), n_splits = 3)
+
+resultats_tuning <- list()
+objets_recherche <- list()
+lignes_tuning <- list()
+
+for (nom_modele in names(modeles)) {
+  cat(strrep("=", 70), "
+")
+  cat("Optimisation du modèle :", nom_modele, "
+")
+
+  debut <- Sys.time()
+
+  optimisation <- optimiser_modele(
+    nom_modele = nom_modele,
+    infos = modeles[[nom_modele]],
+    train_df = train,
+    splits = splits_cv,
+    colonnes_numeriques = colonnes_numeriques,
+    colonnes_categorielles = colonnes_categorielles,
+    ratio_positif = ratio_positif
+  )
+
+  duree <- round(as.numeric(difftime(Sys.time(), debut, units = "secs")), 2)
+
+  resultats_tuning[[nom_modele]] <- optimisation$details
+  objets_recherche[[nom_modele]] <- optimisation
+
+  lignes_tuning[[nom_modele]] <- tibble(
+    modele = nom_modele,
+    methode_recherche = modeles[[nom_modele]]$type_recherche,
+    pr_auc_cv_train = optimisation$best_score,
+    meilleurs_parametres = paste(
+      names(optimisation$best_params),
+      unlist(optimisation$best_params),
+      sep = "=",
+      collapse = " ; "
+    ),
+    duree_secondes = duree
+  )
+
+  cat("Meilleur score CV (PR-AUC) :", round(optimisation$best_score, 4), "
+")
+  cat("Meilleurs paramètres :
+")
+  print(optimisation$best_params)
+  cat("Durée (s) :", duree, "
+")
+}
+
+tableau_tuning <- bind_rows(lignes_tuning) %>%
+  arrange(desc(pr_auc_cv_train)) %>%
+  mutate(pr_auc_cv_train = round(pr_auc_cv_train, 6))
+
+afficher_tableau_pdf(
+  tableau_tuning,
+  colonnes_a_enrouler = c(1, 4),
+  largeurs = c("2.6cm", "1.8cm", "1.6cm", "6.0cm", "1.4cm"),
+  font_size = 6,
+  col_names = c("modèle", "recherche", "PR-AUC CV", "meilleurs paramètres", "durée (s)")
+)
+```
+
+- Ici, on choisit les meilleurs hyperparamètres uniquement sur le **train**. 
+- La métrique de comparaison pendant cette phase est la **PR-AUC au sens de l'Average Precision de scikit-learn**, car notre jeu de données est déséquilibré.
+
+**4.9 – Mettons maintenant les modèles en compétition sur le jeu de validation**
+
+```{r}
+resultats_validation <- list()
+
+for (nom_modele in names(objets_recherche)) {
+  meilleur_modele <- objets_recherche[[nom_modele]]$best_model
+
+  y_proba_valid <- predire_proba(meilleur_modele, valid)
+  y_pred_valid_05 <- ifelse(y_proba_valid >= 0.50, 1, 0)
+
+  pr_auc_valid <- calculer_pr_auc(y_valid, y_proba_valid)
+  roc_auc_valid <- calculer_roc_auc(y_valid, y_proba_valid)
+  precision_valid <- calculer_precision(y_valid, y_pred_valid_05)
+  recall_valid <- calculer_recall(y_valid, y_pred_valid_05)
+  f1_valid <- calculer_f1(y_valid, y_pred_valid_05)
+
+  metriques_top20 <- calculer_lift_recall_top20(y_valid, y_proba_valid, proportion = 0.20)
+
+  resultats_validation[[nom_modele]] <- tibble(
+    modele = nom_modele,
+    pr_auc_validation = pr_auc_valid,
+    roc_auc_validation = roc_auc_valid,
+    precision_validation_0_5 = precision_valid,
+    recall_validation_0_5 = recall_valid,
+    f1_validation_0_5 = f1_valid,
+    lift_top_20_validation = metriques_top20$lift_top_20,
+    recall_top_20_validation = metriques_top20$recall_top_20,
+    meilleurs_parametres = paste(
+      names(objets_recherche[[nom_modele]]$best_params),
+      unlist(objets_recherche[[nom_modele]]$best_params),
+      sep = "=",
+      collapse = " ; "
+    )
+  )
+}
+
+tableau_validation <- bind_rows(resultats_validation) %>%
+  arrange(desc(pr_auc_validation)) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+tableau_validation_affichage <- tableau_validation %>%
+  transmute(
+    modele,
+    pr_auc = pr_auc_validation,
+    roc_auc = roc_auc_validation,
+    precision = precision_validation_0_5,
+    recall = recall_validation_0_5,
+    f1 = f1_validation_0_5,
+    lift_20 = lift_top_20_validation,
+    recall_20 = recall_top_20_validation,
+    meilleurs_parametres
+  )
+
+afficher_tableau_pdf(
+  tableau_validation_affichage,
+  colonnes_a_enrouler = c(1, 9),
+  largeurs = c("1.8cm", "0.9cm", "0.9cm", "0.9cm", "0.9cm", "0.8cm", "1.1cm", "1.2cm", "4.0cm"),
+  font_size = 5,
+  col_names = c("modèle", "PR-AUC", "ROC-AUC", "préc.", "recall", "F1", "Lift@20%", "Recall@20%", "meilleurs paramètres")
+)
+```
+
+Le **meilleur modèle** selon la métrique **PR-AUC** est celui classé en première position dans le tableau ci-dessus.
+
+**4.10 – Identifions le modèle champion**
+
+```{r}
+modele_champion_nom <- tableau_validation$modele[1]
+modele_champion_train <- objets_recherche[[modele_champion_nom]]$best_model
+
+cat("Le modèle champion à ce stade est :", modele_champion_nom, "
+")
+cat("Ses meilleurs hyperparamètres sont :
+")
+print(objets_recherche[[modele_champion_nom]]$best_params)
+```
+
+Le **modèle champion** est : **`r modele_champion_nom`**.
+Il a été retenu car il obtient la meilleure **PR-AUC** sur le jeu de validation. Dans ce projet, cette métrique est la plus adaptée car la classe positive est minoritaire et nous voulons comparer les modèles sur leur capacité globale à bien classer les clients susceptibles de souscrire, sans dépendre d’un seul seuil fixe.
+
+## ETAPE 5: EVALUER LE MODELE
+
+Nous avons choisi le meilleur algorithme. Il faut maintenant :
+1. choisir un **seuil de décision** sur la validation ;
+2. réentraîner le champion sur **train + validation** ;
+3. évaluer une seule fois sur le **test** final.
+
+**5.1 – Choisissons le seuil de décision sur la validation**
+
+```{r}
+y_proba_valid_champion <- predire_proba(modele_champion_train, valid)
+
+seuils_optimises <- choisir_seuil_f1(y_valid, y_proba_valid_champion)
+seuil_retenu <- seuils_optimises$seuil
+tableau_seuils <- seuils_optimises$tableau
+
+cat("Seuil retenu :", round(seuil_retenu, 4), "
+")
+
+afficher_tableau_pdf(
+  head(tableau_seuils, 10) %>% mutate(across(everything(), ~ round(.x, 4))),
+  font_size = 8,
+  col_names = c("seuil", "précision", "recall", "F1")
+)
+```
+
+Le seuil retenu est celui qui **maximise le F1-score sur le jeu de validation**.
+
+**5.2 – Réentraînons le modèle champion sur train + validation**
+
+```{r}
+X_train_valid <- bind_rows(X_train, X_valid)
+y_train_valid <- c(y_train, y_valid)
+
+train_valid <- bind_rows(train, valid)
+
+modele_final <- ajuster_modele(
+  nom_modele = modele_champion_nom,
+  train_df = train_valid,
+  params = objets_recherche[[modele_champion_nom]]$best_params,
+  colonnes_numeriques = colonnes_numeriques,
+  colonnes_categorielles = colonnes_categorielles,
+  ratio_positif = ratio_positif
+)
+
+cat("Le modèle final a été réentraîné sur train + validation.
+")
+```
+
+**5.3 – Évaluons le modèle final sur le test**
+
+```{r}
+y_proba_test <- predire_proba(modele_final, test)
+y_pred_test <- ifelse(y_proba_test >= seuil_retenu, 1, 0)
+
+pr_auc_test <- calculer_pr_auc(y_test, y_proba_test)
+roc_auc_test <- calculer_roc_auc(y_test, y_proba_test)
+precision_test <- calculer_precision(y_test, y_pred_test)
+recall_test <- calculer_recall(y_test, y_pred_test)
+f1_test <- calculer_f1(y_test, y_pred_test)
+
+matrice_conf <- table(
+  Reference = factor(y_test, levels = c(0, 1)),
+  Prediction = factor(y_pred_test, levels = c(0, 1))
+)
+
+metriques_top20_test <- calculer_lift_recall_top20(y_test, y_proba_test, proportion = 0.20)
+lift_top_20_test <- metriques_top20_test$lift_top_20
+recall_top_20_test <- metriques_top20_test$recall_top_20
+
+tableau_test <- tibble(
+  modele_retenu = modele_champion_nom,
+  seuil_retenu = seuil_retenu,
+  pr_auc_test = pr_auc_test,
+  roc_auc_test = roc_auc_test,
+  precision_test = precision_test,
+  recall_test = recall_test,
+  f1_test = f1_test,
+  lift_top_20_test = lift_top_20_test,
+  recall_top_20_test = recall_top_20_test
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4)))
+
+afficher_tableau_pdf(
+  tableau_test,
+  colonnes_a_enrouler = 1,
+  largeurs = c("2.6cm", "1.1cm", "1.1cm", "1.1cm", "1.2cm", "1.1cm", "0.9cm", "1.3cm", "1.4cm"),
+  font_size = 6,
+  col_names = c("modèle retenu", "seuil", "PR-AUC", "ROC-AUC", "précision", "recall", "F1", "Lift@20%", "Recall@20%")
+)
+```
+
+**5.4 – Affichons la matrice de confusion**
+
+```{r}
+as.data.frame(matrice_conf) %>%
+  ggplot(aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5) +
+  labs(title = "Matrice de confusion - modèle final") +
+  theme_minimal()
+```
+
+**5.5 – Conclusion**
+
+```{r}
+cat("MODÈLE FINAL RETENU :", modele_champion_nom, "
+")
+cat("MEILLEURS HYPERPARAMÈTRES :
+")
+print(objets_recherche[[modele_champion_nom]]$best_params)
+cat("SEUIL FINAL RETENU :", round(seuil_retenu, 4), "
+
+")
+
+cat("PR-AUC test :", round(pr_auc_test, 4), "
+")
+cat("ROC-AUC test :", round(roc_auc_test, 4), "
+")
+cat("Precision test :", round(precision_test, 4), "
+")
+cat("Recall test :", round(recall_test, 4), "
+")
+cat("F1 test :", round(f1_test, 4), "
+")
+cat("Lift@20% test :", round(lift_top_20_test, 4), "
+")
+cat("Recall@20% test :", round(recall_top_20_test, 4), "
+")
+```
+
+### Conclusion finale
+
+Le modèle final retenu est **`r modele_champion_nom`**.
+Nous avons opté pour une approche équilibrée dans ce projet, c’est-à-dire que l’objectif n’est pas seulement de maximiser le **nombre de clients détectés**, ni de **réduire les faux positifs** uniquement, mais de trouver un compromis raisonnable entre les deux.
+
+Les résultats obtenus sur le jeu de test montrent ce compromis.
+En **précision**, nous obtenons **`r round(precision_test, 4)`**. Cela signifie que, parmi les clients prédits comme souscripteurs, cette proportion souscrit réellement.
+
+En **recall**, nous obtenons **`r round(recall_test, 4)`**. Cela signifie que le modèle retrouve cette proportion des clients qui auraient réellement souscrit.
+
+Enfin, le **F1-score** vaut **`r round(f1_test, 4)`**. Cette valeur résume l’équilibre entre **précision** et **rappel** au seuil retenu. Pour la lecture métier, nous complétons cette analyse avec **Lift@20% = `r round(lift_top_20_test, 4)`** et **Recall@20% = `r round(recall_top_20_test, 4)`**.
